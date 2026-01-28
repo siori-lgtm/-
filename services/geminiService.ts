@@ -1,68 +1,52 @@
 
 import { GoogleGenAI, Type } from "@google/genai";
-import { FilterConfig, ProblemSetResponse, FileItem } from "../types";
+import { FilterConfig, ProblemSetResponse, FileItem, Question } from "../types";
 import { PT_FIELDS } from "../constants";
 
-export async function processExamPdfs(
-  questionPdfs: FileItem[],
-  dataPdfs: FileItem[],
-  config: FilterConfig
-): Promise<ProblemSetResponse> {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-  // 選択された分野の定義と、PDF内略称との紐付けガイドを作成
+/**
+ * 個別の問題PDFファイルを解析する
+ */
+export async function processSingleExamPdf(
+  file: FileItem,
+  targetYear: string
+): Promise<Question[]> {
   const mappingInstructions = PT_FIELDS
-    .filter(f => config.fields.includes(f.label))
-    .map(f => `- ${f.label}: [PDF内の略称ターゲット: ${f.mappings.join(", ")}] 詳細: ${f.details}`)
+    .map(f => `- [${f.label}]: (キーワード: ${f.mappings.join("/")})`)
     .join("\n");
 
   const systemInstruction = `
-    あなたは理学療法士国家試験（PT国試）の分析および問題集作成の専門家です。
-    提供される試験問題PDFと正答率データPDFから、ユーザーの指定条件に合致する問題を「漏れなく」抽出することが任務です。
+    あなたは理学療法士国家試験（PT国試）の精密データ抽出エンジンです。
+    提出されたPDFから設問を抽出し、以下のルールに従ってJSONで出力してください。
 
-    【解析ワークフロー】
-    1. **正答率照合**: 正答率PDFを走査し、各問題番号（例: 60A-12）の「4校正答率」と「分野略称」を特定します。
-    2. **フィルタリング**: 指定された「正答率下限値（${config.accuracyThreshold === 'all' ? 'なし' : config.accuracyThreshold + '%'}）」および「選択された分野」の両方を満たす問題番号をリストアップします。
-    3. **問題抽出**: リストアップした問題番号に対応する問題を、試験問題PDFから全て抽出します。
-    4. **ビジュアル解析**: 図、写真、グラフ、表が含まれる場合は、その内容を「試験に出るポイント」を押さえて詳細に言語化し、imageDescriptionに記述してください。
-
-    【分野マッピング定義】
-    PDF内の略称を以下の抽出分野にマッピングしてください：
+    【抽出ルール】
+    1. **問題番号 (displayNumber)**: 
+       - 「午前1」「午後1」などの表記から「${targetYear.replace(/[^0-9]/g, '')}A-1」や「${targetYear.replace(/[^0-9]/g, '')}P-1」の形式に変換。
+    2. **設問本文 (body)**: 設問の文章のみを抽出。
+    3. **選択肢 (options)**: 
+       - 1番から5番まで全てのテキストを配列に格納。
+       - 各要素から「1.」「2.」「①」「②」などの番号プレフィックスは削除。
+       - 選択肢が空にならないよう、PDFから一言一句正確に取得。
+    4. **正解 (correctAnswer)**: 資料内の赤枠または「解答：X」の表記から、1〜5の数値を特定。
+    5. **分野 (category)**: 
+       - 以下のリストから1つ選択。
     ${mappingInstructions}
 
-    【出力仕様】
-    - 出力は必ずJSON形式。
-    - categoryには抽出分野名（例: 臨床症例（運動器））を直接入れてください。
-    - displayNumberは「[回][区分]-[番号]」（例: 60A-4）の形式で統一してください。
+    【出力形式】
+    必ず {"questions": [...]} というJSONオブジェクトで返してください。
   `;
 
-  const prompt = `
-    アップロードされた全ての資料を精査し、条件に合致する問題を1問も漏らさずに抽出して、一冊の問題集として構成してください。
-    
-    【抽出条件】
-    - 4校正答率: ${config.accuracyThreshold === 'all' ? '全範囲' : config.accuracyThreshold + '%以上'}
-    - 抽出対象分野: ${config.fields.join(", ")}
-    
-    PDFの全ページ、全テーブルを確実にチェックしてください。該当する問題が10問以上ある場合でも、制限なく可能な限り全て出力してください。
-  `;
-
-  const questionParts = questionPdfs.map(file => ({
-    inlineData: { mimeType: "application/pdf", data: file.base64 }
-  }));
-  
-  const dataParts = dataPdfs.map(file => ({
-    inlineData: { mimeType: "application/pdf", data: file.base64 }
-  }));
+  const prompt = `このPDFから、${targetYear}の設問を、選択肢（1〜5番全て）を含めて正確に抽出してください。`;
 
   try {
     const response = await ai.models.generateContent({
       model: "gemini-3-flash-preview",
-      contents: {
+      contents: { 
         parts: [
-          ...questionParts,
-          ...dataParts,
+          { inlineData: { mimeType: "application/pdf", data: file.base64 } },
           { text: prompt }
-        ]
+        ] 
       },
       config: {
         systemInstruction,
@@ -78,9 +62,11 @@ export async function processExamPdfs(
                   displayNumber: { type: Type.STRING },
                   category: { type: Type.STRING },
                   body: { type: Type.STRING },
-                  options: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING }
+                  options: { 
+                    type: Type.ARRAY, 
+                    items: { type: Type.STRING },
+                    minItems: 5,
+                    maxItems: 5
                   },
                   correctAnswer: { type: Type.STRING },
                   accuracyRate: { type: Type.NUMBER },
@@ -95,10 +81,74 @@ export async function processExamPdfs(
       }
     });
 
-    const resultText = response.text || "{}";
-    return JSON.parse(resultText) as ProblemSetResponse;
+    const parsed = JSON.parse(response.text || "{\"questions\":[]}");
+    return (parsed.questions || []).map((q: any) => ({ ...q, year: targetYear }));
   } catch (error) {
-    console.error("Gemini API Error:", error);
+    console.error(`Extraction Failed (${file.name}):`, error);
+    return [];
+  }
+}
+
+/**
+ * 正答率PDFを解析する
+ */
+export async function processAccuracyPdf(files: FileItem[]): Promise<{ displayNumber: string, accuracyRate: number, category: string }[]> {
+  const mappingInstructions = PT_FIELDS
+    .map(f => `- [${f.label}] (キーワード: ${f.mappings.join("/")})`)
+    .join("\n");
+
+  const systemInstruction = `
+    あなたは理学療法士国家試験の統計表解析官です。
+    PDF内の表（問題番号、分野、正答率が並んでいる表）を解析し、JSONで出力してください。
+
+    【解析ルール】
+    1. **問題番号の特定**:
+       - ページ上部の「午前」「午後」を確認。
+       - 表の「No.」が1番なら、午前なら「XXA-1」、午後なら「XXP-1」とする（XXは年度）。
+    2. **正答率の抽出**:
+       - 「正答率」列の数値を抽出。
+    3. **分野の変換**:
+       - 略称を以下の正式名称に変換。
+    ${mappingInstructions}
+
+    必ず {"mappings": [...]} というJSONで返してください。
+  `;
+
+  const prompt = "表内の全問題（最大200問程度）を1つも漏らさずにリストアップしてください。";
+  const fileParts = files.map(file => ({ inlineData: { mimeType: "application/pdf", data: file.base64 } }));
+
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-3-flash-preview",
+      contents: { parts: [...fileParts, { text: prompt }] },
+      config: {
+        systemInstruction,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            mappings: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  displayNumber: { type: Type.STRING },
+                  accuracyRate: { type: Type.NUMBER },
+                  category: { type: Type.STRING }
+                },
+                required: ["displayNumber", "accuracyRate", "category"]
+              }
+            }
+          },
+          required: ["mappings"]
+        }
+      }
+    });
+
+    const data = JSON.parse(response.text || "{\"mappings\":[]}");
+    return data.mappings;
+  } catch (error) {
+    console.error("Accuracy Extraction Error:", error);
     throw error;
   }
 }
